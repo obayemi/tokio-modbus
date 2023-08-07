@@ -89,8 +89,10 @@ where
     S::Error: Into<io::Error>,
 {
     loop {
+        log::info!("waiting for frame");
         let Some(request) = framed.next().await.transpose()? else {
             log::debug!("Stream has finished");
+            //framed.read_buffer_mut().clear();
             break;
         };
 
@@ -103,6 +105,7 @@ where
                 log::debug!("Sending no response for request {hdr:?}");
                 continue;
         };
+        //framed.read_buffer_mut().clear();
 
         framed
             .send(ResponseAdu {

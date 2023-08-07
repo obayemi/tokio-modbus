@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2017-2023 slowtec GmbH <post@slowtec.de>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::io::{Cursor, Error, ErrorKind, Result};
-
 use byteorder::BigEndian;
 use smallvec::SmallVec;
+use std::cmp;
+use std::io::{Cursor, Error, ErrorKind, Result};
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::{
@@ -37,7 +37,7 @@ impl Default for FrameDecoder {
 impl FrameDecoder {
     pub(crate) fn decode(
         &mut self,
-        buf: &mut BytesMut,
+        buf: &Bytes,
         pdu_len: usize,
     ) -> Result<Option<(SlaveId, Bytes)>> {
         const CRC_BYTE_COUNT: usize = 2;
@@ -49,24 +49,26 @@ impl FrameDecoder {
             return Ok(None);
         }
 
-        let mut adu_buf = buf.split_to(adu_len);
-        let crc_buf = buf.split_to(CRC_BYTE_COUNT);
+        //log::info!("aa");
+        let adu_buf = buf.slice(..adu_len);
+        //log::info!("bb");
+        let crc_buf = buf.slice(adu_len..adu_len + CRC_BYTE_COUNT);
+        //log::info!("cc");
 
         // Read trailing CRC and verify ADU
         let crc_result = Cursor::new(&crc_buf)
             .read_u16::<BigEndian>()
             .and_then(|crc| check_crc(&adu_buf, crc));
 
+        //log::info!("dd");
+
         if let Err(err) = crc_result {
             // CRC is invalid - restore the input buffer
-            let rem_buf = buf.split();
-            debug_assert!(buf.is_empty());
-            buf.unsplit(adu_buf);
-            buf.unsplit(crc_buf);
-            buf.unsplit(rem_buf);
-
+            //debug_assert!(buf.is_empty());
             return Err(err);
         }
+
+        //log::info!("ee");
 
         if !self.dropped_bytes.is_empty() {
             log::warn!(
@@ -76,30 +78,33 @@ impl FrameDecoder {
             );
             self.dropped_bytes.clear();
         }
-        let slave_id = adu_buf.split_to(1)[0];
-        let pdu_data = adu_buf.freeze();
+
+        //log::info!("ff");
+
+        let slave_id = adu_buf[0];
+        let pdu_data = adu_buf.slice(1..);
 
         Ok(Some((slave_id, pdu_data)))
     }
 
-    pub(crate) fn recover_on_error(&mut self, buf: &mut BytesMut) {
+    pub(crate) fn recover_on_error(&mut self, buf: &mut Bytes) {
         // If decoding failed the buffer cannot be empty
-        debug_assert!(!buf.is_empty());
-        // Skip and record the first byte of the buffer
-        {
-            let first = buf.first().unwrap();
-            log::debug!("Dropped first byte: {:X?}", first);
-            if self.dropped_bytes.len() >= MAX_FRAME_LEN {
-                log::error!(
-                    "Giving up to decode frame after dropping {} byte(s): {:X?}",
-                    self.dropped_bytes.len(),
-                    self.dropped_bytes
-                );
-                self.dropped_bytes.clear();
-            }
-            self.dropped_bytes.push(*first);
-        }
-        buf.advance(1);
+        //debug_assert!(!buf.is_empty());
+        //// Skip and record the first byte of the buffer
+        //{
+        //let first = buf.first().unwrap();
+        //log::debug!("Dropped first byte: {:X?}", first);
+        //if self.dropped_bytes.len() >= MAX_FRAME_LEN {
+        //log::error!(
+        //"Giving up to decode frame after dropping {} byte(s): {:X?}",
+        //self.dropped_bytes.len(),
+        //self.dropped_bytes
+        //);
+        //self.dropped_bytes.clear();
+        //}
+        //self.dropped_bytes.push(*first);
+        //}
+        //buf.advance(1);
     }
 }
 
@@ -123,7 +128,7 @@ pub(crate) struct ServerCodec {
     pub(crate) decoder: RequestDecoder,
 }
 
-fn get_request_pdu_len(adu_buf: &BytesMut) -> Result<Option<usize>> {
+fn get_request_pdu_len(adu_buf: &Bytes) -> Result<Option<usize>> {
     if let Some(fn_code) = adu_buf.get(1) {
         let len = match fn_code {
             0x01..=0x06 => 5,
@@ -153,7 +158,7 @@ fn get_request_pdu_len(adu_buf: &BytesMut) -> Result<Option<usize>> {
     }
 }
 
-fn get_response_pdu_len(adu_buf: &BytesMut) -> Result<Option<usize>> {
+fn get_response_pdu_len(adu_buf: &Bytes) -> Result<Option<usize>> {
     if let Some(fn_code) = adu_buf.get(1) {
         #[allow(clippy::match_same_arms)]
         let len = match fn_code {
@@ -218,7 +223,15 @@ impl Decoder for RequestDecoder {
     type Error = Error;
 
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<(SlaveId, Bytes)>> {
-        decode("request", &mut self.frame_decoder, get_request_pdu_len, buf)
+        match decode("request", &mut self.frame_decoder, get_request_pdu_len, buf) {
+            Err(e) => {
+                if buf.len() >= 256 {
+                    buf.advance(1);
+                }
+                Err(e)
+            }
+            r => r,
+        }
     }
 }
 
@@ -227,12 +240,20 @@ impl Decoder for ResponseDecoder {
     type Error = Error;
 
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<(SlaveId, Bytes)>> {
-        decode(
+        match decode(
             "response",
             &mut self.frame_decoder,
             get_response_pdu_len,
             buf,
-        )
+        ) {
+            Err(e) => {
+                if buf.len() >= 256 {
+                    buf.advance(1);
+                }
+                Err(e)
+            }
+            r => r,
+        }
     }
 }
 
@@ -243,32 +264,46 @@ fn decode<F>(
     buf: &mut BytesMut,
 ) -> Result<Option<(SlaveId, Bytes)>>
 where
-    F: Fn(&BytesMut) -> Result<Option<usize>>,
+    F: Fn(&Bytes) -> Result<Option<usize>>,
 {
-    const MAX_RETRIES: usize = 20;
+    let max_retries: usize = cmp::min(256, buf.len());
 
-    for _i in 0..MAX_RETRIES {
-        let result = get_pdu_len(buf).and_then(|pdu_len| {
-            let Some(pdu_len) = pdu_len else {
+    // refactor to work with slices
+    log::info!("received buffer of size {}", buf.len());
+    let freezed = buf.clone().freeze();
+
+    for i in 0..max_retries {
+        let slice = freezed.slice(i..);
+        log::info!("read retry: {i}: buff: {slice:02X?}");
+        let result = get_pdu_len(&slice).and_then(|pdu_len| {
+            if let Some(pdu_len) = pdu_len {
+                let frame = frame_decoder.decode(&slice, pdu_len);
+                log::info!("found complete frame: {slice:02X?}");
+                frame
+            } else {
+                log::info!("found incomplete frame: {slice:02X?}");
                 // Incomplete frame
-                return Ok(None);
-            };
-
-            frame_decoder.decode(buf, pdu_len)
+                Ok(None)
+            }
         });
 
         if let Err(err) = result {
             log::warn!("Failed to decode {pdu_type} frame: {err}");
-            frame_decoder.recover_on_error(buf);
             continue;
         }
 
-        return result;
+        if let Ok(Some(frame)) = result {
+            let advance_amount = i + frame.1.len() + 3;
+            log::info!("advancing buffer {advance_amount} bytes");
+            buf.advance(advance_amount);
+            return Ok(Some(frame));
+        }
     }
 
     // Maximum number of retries exceeded.
-    log::error!("Giving up to decode frame after {MAX_RETRIES} retries");
-    Err(Error::new(ErrorKind::InvalidData, "Too many retries"))
+    log::error!("Giving up to decode frame after {max_retries} retries");
+    Ok(None)
+    //Err(Error::new(ErrorKind::InvalidData, "Too many retries"))
 }
 
 impl Decoder for ClientCodec {
