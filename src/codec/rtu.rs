@@ -267,6 +267,9 @@ where
     F: Fn(&Bytes) -> Result<Option<usize>>,
 {
     let max_retries: usize = cmp::min(256, buf.len());
+    if buf.len() == 0 {
+        return Ok(None);
+    }
 
     // refactor to work with slices
     log::info!("received buffer of size {}", buf.len());
